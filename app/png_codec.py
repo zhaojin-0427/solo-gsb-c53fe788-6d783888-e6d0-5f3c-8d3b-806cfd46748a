@@ -3,71 +3,150 @@
 * 输入切片：JSON 嵌套数组 <-> base64 PNG 两种等价编码；
 * 输出产物：真彩色预览 PNG（无数据透明）、逐像元来源索引着色 PNG。
 
-多波段 PNG 的通道约定：L=1、LA=2、RGB=3、RGBA=4，按 R,G,B,A 顺序映射波段。
-``float32`` 或超过 4 个波段时请使用 JSON 数组编码（PNG 无法无损表达这些情况）。
+多波段 PNG 的通道约定：L=1、LA=2、RGB=3、RGBA=4，按 R,G,B,A 顺序映射波段；
+``I;16`` 为单波段 16 位灰度 PNG。``float32`` 或超过 4 个波段时请使用 JSON
+数组编码（PNG 无法无损表达这些情况）。
+
+dtype 语义（``tile.bands_dtype``）：
+
+* 省略（null）—— JSON 数组按内容自动判定（整数保留 int64，小数按 float64，
+  负数无数据哨兵原样保留）；PNG 按其位深解码为 uint8/uint16；
+* 显式 ``uint8`` / ``uint16`` —— 像元必须能被目标无符号类型表示，负数或
+  超出上限一律 422，绝不静默回绕成有效值；
+* 显式 ``float32`` —— 仅支持 JSON 数组编码。
 """
 from __future__ import annotations
 
 import base64
 import io
-from typing import Any
 
 import numpy as np
 from PIL import Image
 
+from .errors import MosaicError
 from .models import TileIn
 
-_MODE_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4}
+_MODE_CHANNELS = {"L": 1, "LA": 2, "RGB": 3, "RGBA": 4, "I;16": 1}
+
+_DTYPES = {"uint8": np.uint8, "uint16": np.uint16, "float32": np.float32}
+_UNSIGNED_MAX = {"uint8": 255, "uint16": 65535}
 
 
-def _b64_to_image(data: str) -> Image.Image:
-    raw = base64.b64decode(data, validate=True)
-    return Image.open(io.BytesIO(raw))
+def _b64_to_image(tile: TileIn) -> Image.Image:
+    try:
+        raw = base64.b64decode(tile.bands_png, validate=True)
+        img = Image.open(io.BytesIO(raw))
+        img.load()
+    except Exception as exc:  # Pillow raises various errors
+        raise MosaicError(f"tile {tile.id} 的 bands_png 无法解码: {exc}") from exc
+    return img
 
 
-def _image_to_array(img: Image.Image, dtype: str) -> np.ndarray:
-    """返回形状 [band, height, width] 的数组。"""
-    if dtype == "float32":
-        raise ValueError("PNG 编码不支持 float32，请改用 bands JSON 数组")
+def _to_numeric(values, tile: TileIn) -> np.ndarray:
+    """JSON 数组先转 float64（足以精确表示 int64 范围内的整数哨兵），
+    同时把不规则数组、非数值元素、超大整数等问题统一暴露为 422。
+    """
+    try:
+        return np.asarray(values, dtype=np.float64)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise MosaicError(f"tile {tile.id} 的 bands 不是规则的数值三维数组: {exc}") from exc
+
+
+def _check_unsigned(arr: np.ndarray, dtype_name: str, tile: TileIn) -> None:
+    """显式无符号类型：越界（负数/超上限/非有限/非整数）即 422，禁止回绕。"""
+    finite = np.isfinite(arr)
+    integral = arr == np.floor(arr)
+    in_range = (arr >= 0) & (arr <= _UNSIGNED_MAX[dtype_name])
+    bad = ~(finite & integral & in_range)
+    if bad.any():
+        n = int(bad.sum())
+        sample = next(
+            (float(v) for v, b in zip(arr.ravel(), bad.ravel(), strict=True) if b), None
+        )
+        raise MosaicError(
+            f"tile {tile.id} 显式声明 bands_dtype={dtype_name}，但存在 {n} 个无法由该"
+            f"无符号类型表示的像元（首个 {sample}）；无符号像元必须是 [0, "
+            f"{_UNSIGNED_MAX[dtype_name]}] 内的整数。请移除越界像元、改用非负 nodata，"
+            "或省略 bands_dtype / 改用 float32 以保留负数哨兵。"
+        )
+
+
+def _decode_bands_array(tile: TileIn) -> np.ndarray:
+    """解码 JSON 波段矩阵为 [band, height, width] 数组。"""
+    if tile.bands_dtype is None:
+        # 自动判定：先以 float64 做结构校验，再让 NumPy 按原始内容选 dtype，
+        # 负数（如 -9999 哨兵）不会被无符号收窄成大正数或抛 OverflowError。
+        numeric = _to_numeric(tile.bands, tile)
+        if numeric.ndim != 3:
+            raise MosaicError(
+                f"tile {tile.id} 的 bands 形状应为 [band, height, width]，"
+                f"实际维度 {numeric.ndim}"
+            )
+        try:
+            arr = np.asarray(tile.bands)
+        except (TypeError, ValueError) as exc:
+            raise MosaicError(f"tile {tile.id} 的 bands 不是规则的数值三维数组: {exc}") from exc
+        if arr.dtype.kind not in "iuf" or arr.ndim != 3:
+            raise MosaicError(
+                f"tile {tile.id} 的 bands 必须是规则的 [band, height, width] 数值数组"
+                f"（实际 dtype={arr.dtype}，维度 {arr.ndim}）"
+            )
+        return arr
+
+    dtype_name = tile.bands_dtype
+    numeric = _to_numeric(tile.bands, tile)
+    if numeric.ndim != 3:
+        raise MosaicError(
+            f"tile {tile.id} 的 bands 形状应为 [band, height, width]，"
+            f"实际维度 {numeric.ndim}"
+        )
+    if dtype_name in _UNSIGNED_MAX:
+        _check_unsigned(numeric, dtype_name, tile)
+        return numeric.astype(_DTYPES[dtype_name])
+    # float32：有限性按既有语义不做强约束（NaN/Inf 可由 float32 表示）
+    try:
+        return numeric.astype(_DTYPES[dtype_name])
+    except (TypeError, ValueError) as exc:
+        raise MosaicError(f"tile {tile.id} 的 bands 无法转为 {dtype_name}: {exc}") from exc
+
+
+def _png_to_array(img: Image.Image) -> np.ndarray:
+    """返回保持 PNG 原始位深的 [band, height, width] 数组。"""
     arr = np.asarray(img)
     if arr.ndim == 2:
         arr = arr[None, :, :]
     elif arr.ndim == 3:
         arr = np.moveaxis(arr, 2, 0)
     else:
-        raise ValueError(f"无法解析的 PNG 维度: {arr.shape}")
-    # Pillow 的 I;16 可能以大端字节序暴露，统一转回目标 dtype
-    return arr.astype(_DTYPES[dtype], copy=False)
-
-
-_DTYPES = {"uint8": np.uint8, "uint16": np.uint16, "float32": np.float32}
+        raise MosaicError(f"无法解析的 PNG 维度: {arr.shape}")
+    # Pillow 的 I;16 可能以大端字节序暴露，统一到本机字节序后再比较/转换
+    return arr.astype(arr.dtype.newbyteorder("="))
 
 
 def decode_bands(tile: TileIn) -> np.ndarray:
     """解码波段矩阵为 [band, height, width] 数组。"""
     if tile.bands is not None:
-        try:
-            arr = np.asarray(tile.bands, dtype=_DTYPES[tile.bands_dtype])
-        except (TypeError, ValueError) as exc:
-            raise ValueError(f"tile {tile.id} 的 bands 不是规则的三维数组: {exc}") from exc
-        if arr.ndim != 3:
-            raise ValueError(
-                f"tile {tile.id} 的 bands 形状应为 [band, height, width]，实际维度 {arr.ndim}"
-            )
-        return arr
-    assert tile.bands_png is not None
-    try:
-        img = _b64_to_image(tile.bands_png)
-        img.load()
-    except Exception as exc:  # Pillow raises various errors
-        raise ValueError(f"tile {tile.id} 的 bands_png 无法解码: {exc}") from exc
+        return _decode_bands_array(tile)
+
+    img = _b64_to_image(tile)
     if img.mode not in _MODE_CHANNELS:
-        raise ValueError(
+        raise MosaicError(
             f"tile {tile.id} 的 bands_png 模式 {img.mode} 不受支持，"
-            "请使用 L/LA/RGB/RGBA（分别对应 1/2/3/4 波段）"
+            "请使用 L/LA/RGB/RGBA（分别对应 1/2/3/4 波段）或 I;16（单波段 16 位）"
         )
-    arr = _image_to_array(img, tile.bands_dtype)
-    return arr
+    arr = _png_to_array(img)
+
+    if tile.bands_dtype is None:
+        # PNG 位深即类型：L/LA/RGB/RGBA -> uint8，I;16 -> uint16
+        if arr.dtype.kind not in "iu":
+            raise MosaicError(f"tile {tile.id} 的 PNG 位深类型 {arr.dtype} 不受支持")
+        return arr
+    if tile.bands_dtype == "float32":
+        raise MosaicError("PNG 编码不支持 float32，请改用 bands JSON 数组")
+    dtype_name = tile.bands_dtype
+    arr64 = arr.astype(np.float64)
+    _check_unsigned(arr64, dtype_name, tile)
+    return arr64.astype(_DTYPES[dtype_name])
 
 
 def decode_cloud(tile: TileIn, height: int, width: int) -> np.ndarray:
@@ -76,23 +155,25 @@ def decode_cloud(tile: TileIn, height: int, width: int) -> np.ndarray:
         try:
             arr = np.asarray(tile.cloud_mask, dtype=np.uint8)
         except (TypeError, ValueError) as exc:
-            raise ValueError(f"tile {tile.id} 的 cloud_mask 不是规则二维数组: {exc}") from exc
+            raise MosaicError(
+                f"tile {tile.id} 的 cloud_mask 不是规则二维数组: {exc}"
+            ) from exc
     else:
         assert tile.cloud_mask_png is not None
         try:
-            img = _b64_to_image(tile.cloud_mask_png)
+            raw = base64.b64decode(tile.cloud_mask_png, validate=True)
+            img = Image.open(io.BytesIO(raw))
             img.load()
         except Exception as exc:
-            raise ValueError(f"tile {tile.id} 的 cloud_mask_png 无法解码: {exc}") from exc
+            raise MosaicError(f"tile {tile.id} 的 cloud_mask_png 无法解码: {exc}") from exc
         if img.mode != "L":
             img = img.convert("L")
         arr = np.asarray(img, dtype=np.uint8)
     if arr.ndim != 2 or arr.shape != (height, width):
-        raise ValueError(
+        raise MosaicError(
             f"tile {tile.id} 的 cloud_mask 形状 {arr.shape} 与波段矩阵 ({height}, {width}) 不一致"
         )
     return arr > 0
-
 
 # ------------------------------------------------------------------ 输出 PNG
 

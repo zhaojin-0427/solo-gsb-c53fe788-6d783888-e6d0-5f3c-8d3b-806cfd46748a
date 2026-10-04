@@ -75,9 +75,20 @@ def input_summary(payload: dict[str, Any]) -> dict[str, Any]:
             n_bands = len(bands)
             height = len(bands[0]) if n_bands else 0
             width = len(bands[0][0]) if height else 0
-            bands_desc = {"encoding": "array", "bands": n_bands, "height": height, "width": width}
+            # dtype 省略（None）记为 "auto"：与显式声明必须可区分，
+            # 避免“负数哨兵自动保留”与“显式 uint16”在摘要/幂等上混用
+            bands_desc = {
+                "encoding": "array",
+                "bands": n_bands,
+                "height": height,
+                "width": width,
+                "dtype": t.get("bands_dtype") or "auto",
+            }
         else:
-            bands_desc = {"encoding": "png"}
+            bands_desc = {
+                "encoding": "png",
+                "dtype": t.get("bands_dtype") or "auto",
+            }
         if t.get("cloud_mask") is not None:
             cm = t["cloud_mask"]
             bands_desc["cloud"] = {"encoding": "array", "height": len(cm), "width": len(cm[0]) if cm else 0}

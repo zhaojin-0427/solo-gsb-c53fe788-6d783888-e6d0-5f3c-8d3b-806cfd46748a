@@ -358,8 +358,11 @@ def test_png_encoding_roundtrip(client):
     }
     out = post(client, payload)
     bands = np.array(out["bands"])
-    # 两时相清晰 -> 选新 arr-tile(999)，除 png tile 的云点 (0,0)
-    assert bands[0, 0, 0] == 120
+    # (1,1) 两时相都清晰 -> 按云量优先选云量更少且更新的 arr-tile(999)。
+    # (0,0) 是 png-tile 的云点（该时相此像元不可用），而 arr-tile 在该处清晰，
+    # 云隙拼接必须由唯一清晰候选 arr-tile 填补 -> 999；120 位于云像元之下，
+    # 永不能作为结果（与 test_complementary_cloud_gap_fill 的“云像元不入选”一致）。
+    assert bands[0, 0, 0] == 999
     assert bands[0, 1, 1] == 999
     assert out["preview_png"].startswith("data:image/png;base64,")
     assert out["source_map_png"].startswith("data:image/png;base64,")
@@ -389,3 +392,114 @@ def test_determinism(client):
     assert j1["id"] == j2["id"]  # 幂等命中
     assert j1["bands"] == j2["bands"]
     assert j1["source_map"] == j2["source_map"]
+
+
+# ------------------------------------------------ dtype / 负数无数据哨兵
+
+
+def _two_tile_payload(a, b, dtype=None, w=2, h=2):
+    def enc(arr, tid, ts):
+        t = make_tile(tid, ts, arr)
+        if dtype is not None:
+            t["bands_dtype"] = dtype
+        return t
+
+    return {
+        "tiles": [
+            enc(a, "t1", "2026-09-01T10:00:00Z"),
+            enc(b, "t2", "2026-09-01T11:00:00Z"),
+        ],
+        "target": base_target(w, h),
+        "max_time_delta_seconds": 3600,
+    }
+
+
+def test_omitted_dtype_preserves_negative_nodata(client):
+    """回归：省略 bands_dtype 时 -9999 哨兵须原样保留并参与选源，不再 OverflowError。"""
+    a = np.full((1, 2, 2), 10, dtype=np.int32)
+    a[0, 0, 0] = -9999
+    b = np.full((1, 2, 2), 20, dtype=np.int32)
+    payload = _two_tile_payload(a, b)  # 两个切片都不声明 bands_dtype
+    r = client.post("/mosaics", json=payload)
+    assert r.status_code == 201, r.text
+    out = r.json()
+    # t1 缺 (0,0)，t2 在该处清晰 -> 由 t2 填补
+    assert out["bands"][0][0][0] == 20
+    assert out["source_map"][0][0] == 1
+    assert out["coverage"]["hole_pixels"] == 0
+
+
+def test_later_nodata_erases_earlier_fill_omitted_dtype(client):
+    """省略类型时 nodata 仍是“无观测”：更晚切片声明 nodata 会抹掉早先填充。"""
+    a = np.full((1, 2, 2), 10, dtype=np.int32)
+    b = np.full((1, 2, 2), 20, dtype=np.int32)
+    b[0, 1, 1] = -9999
+    payload = _two_tile_payload(a, b)
+    out = post(client, payload)
+    assert out["bands"][0][1][1] == -9999.0
+    assert out["source_map"][1][1] == -1
+
+
+def test_explicit_uint16_negative_returns_422(client):
+    """显式 uint16 遇到负数像元必须 422，不能回绕成 55537 之类的大正数。"""
+    a = np.full((1, 2, 2), 100, dtype=np.int32)
+    a[0, 0, 1] = -9999
+    b = np.full((1, 2, 2), 200, dtype=np.int32)
+    payload = _two_tile_payload(a, b, dtype="uint16")
+    r = client.post("/mosaics", json=payload)
+    assert r.status_code == 422, r.text
+    assert "uint16" in r.json()["detail"]
+    # 同体若省略类型则成功（负数被保留），证明两条路径被区分
+    ok_payload = _two_tile_payload(a, b, dtype=None)
+    assert post(client, ok_payload)["coverage"]["hole_pixels"] == 0
+
+
+def test_explicit_uint8_overflow_returns_422(client):
+    """显式 uint8 超上限（如 300）必须 422。"""
+    a = np.full((1, 2, 2), 300, dtype=np.int32)  # 300 超出 uint8
+    b = np.full((1, 2, 2), 200, dtype=np.int32)
+    payload = _two_tile_payload(a, b, dtype="uint8")
+    r = client.post("/mosaics", json=payload)
+    assert r.status_code == 422
+    assert "uint8" in r.json()["detail"]
+
+
+def test_explicit_nonnegative_uint_types_work(client):
+    """显式 uint8/uint16 的非负合法像元行为与省略类型一致。"""
+    a = np.full((1, 2, 2), 10, dtype=np.int32)
+    b = np.full((1, 2, 2), 20, dtype=np.int32)
+    by_type = {}
+    for dtype in ("uint8", "uint16", None):
+        out = post(client, _two_tile_payload(a, b, dtype=dtype))
+        by_type[dtype] = out
+    for dtype in ("uint8", "uint16"):
+        assert by_type[dtype]["bands"] == by_type[None]["bands"]
+        assert by_type[dtype]["source_map"] == by_type[None]["source_map"]
+        assert by_type[dtype]["coverage"] == by_type[None]["coverage"]
+
+
+def test_omitted_vs_explicit_dtype_have_distinct_results(client):
+    """省略类型与显式声明是不同请求：hash、任务 id 均不得共用。"""
+    a = np.full((1, 2, 2), 310, dtype=np.int32)
+    b = np.full((1, 2, 2), 420, dtype=np.int32)
+    omitted = _two_tile_payload(a, b, dtype=None)
+    explicit = _two_tile_payload(a, b, dtype="uint16")
+    omitted["tiles"][0]["id"] = "auto-a"
+    omitted["tiles"][1]["id"] = "auto-b"
+    explicit["tiles"][0]["id"] = "auto-a"
+    explicit["tiles"][1]["id"] = "auto-b"
+    j1 = post(client, omitted)
+    j2 = post(client, explicit)
+    assert j1["request_hash"] != j2["request_hash"]
+    assert j1["id"] != j2["id"]
+    # 各自幂等重试仍命中自身结果（重试返回 200）
+    assert client.post("/mosaics", json=omitted).json()["id"] == j1["id"]
+    assert client.post("/mosaics", json=explicit).json()["id"] == j2["id"]
+
+
+def test_auto_dtype_keeps_decimals(client):
+    """省略类型时小数数组按浮点保留，不被收窄成整数。"""
+    a = np.full((1, 1, 1), 1.5, dtype=np.float64)
+    b = np.full((1, 1, 1), 2.25, dtype=np.float64)
+    out = post(client, _two_tile_payload(a, b, w=1, h=1))
+    assert out["bands"][0][0][0] == 2.25

@@ -4,7 +4,8 @@
 
 1. 切片总云量 ``cloud_fraction`` 升序（云少优先）；
 2. 与参考时间（所有切片中的最新采集时间）的时间差升序；
-3. 到切片边缘的距离降序（优先使用切片内部像元，规避边缘）；
+3. 到切片左上角（原点）的轴对齐入深距离 ``max(row, col)`` 降序（优先使用
+   沿行列方向都远离切入边的像元，规避边缘）；
 4. 切片在请求中的序号 ``tile_order`` 升序（最终确定性裁决）。
 
 仿射对齐：切片必须与目标网格同分辨率（允许 1e-6 相对容差），
@@ -20,6 +21,7 @@ from typing import Any
 import numpy as np
 
 from .config import settings
+from .errors import MosaicError
 from .models import (
     BBox,
     ConflictEvidenceOut,
@@ -36,10 +38,6 @@ _NEIGH = ((-1, 0), (1, 0), (0, -1), (0, 1))
 _KEY_COMPONENTS = 4
 # 字典序键的“空槽”哨兵，排在任何真实候选之后
 _SENTINEL = np.array([np.inf, np.inf, np.inf, np.inf], dtype=np.float64)
-
-
-class MosaicError(ValueError):
-    """可返回给客户端的 422 业务错误。"""
 
 
 def _parse_time(raw: str, tile_id: str) -> datetime:
@@ -179,15 +177,13 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
             else None
         )
         cloud_fraction = float(clouds[order].mean()) if th * tw else 0.0
-        # 切片局部坐标中到最近边缘的距离（轴对齐，确定性的边缘度量）
+        # 切片局部坐标中到左上角（切片原点）的轴对齐入深距离 max(row, col)：
+        # 沿行列两个方向都越深入切片内部（远离切入边缘），像元越可信
         rows = np.arange(th, dtype=np.float64).reshape(th, 1)
         cols = np.arange(tw, dtype=np.float64).reshape(1, tw)
-        edge_dist = np.minimum(
-            np.minimum(np.broadcast_to(rows, (th, tw)), np.broadcast_to(cols, (th, tw))),
-            np.minimum(
-                np.broadcast_to(th - 1 - rows, (th, tw)),
-                np.broadcast_to(tw - 1 - cols, (th, tw)),
-            ),
+        edge_dist = np.maximum(
+            np.broadcast_to(rows, (th, tw)),
+            np.broadcast_to(cols, (th, tw)),
         )
         tile_infos.append(
             {
@@ -217,6 +213,10 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
     second_key = np.broadcast_to(_SENTINEL[:, None, None], (_KEY_COMPONENTS, H, W)).copy()
     second_values = np.full((band_count, H, W), np.nan, dtype=np.float64)
     overlap_multi = np.zeros((H, W), dtype=bool)
+    # 按请求顺序记录“最后一个覆盖该像元的非云切片上，像元是否有效”：
+    #   清晰像元 -> True；非云 nodata -> False（晚到的无观测抹掉早先填充）；
+    #   云 -> 该时相不可用但不是无观测，状态沿用此前时相（云隙回退填补）。
+    last_noncloud_clear = np.zeros((H, W), dtype=bool)
 
     for info in tile_infos:
         if info["excluded"]:
@@ -244,9 +244,20 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
         win_cloud = info["cloud"][tr0:tr1, tc0:tc1]
         win_edge = info["edge_dist"][tr0:tr1, tc0:tc1]
 
-        valid = ~win_cloud
+        win_nodata = np.zeros((r1 - r0, c1 - c0), dtype=bool)
         for k in range(band_count):
-            valid &= win_bands[k] != info["nodata"]
+            win_nodata |= win_bands[k] == info["nodata"]
+        # 按请求顺序记录本切片在窗内的“最新观测状态”：
+        #   清晰像元 -> CLEAR；非云 nodata -> NODATA；云不改变此前时相留下的状态。
+        # 最终像元仅在“最新非云观测为清晰”时有值，故晚到的 nodata 会抹掉早先
+        # 的填充，而晚到的清晰像元也会覆盖早先的 nodata；云始终留给其他时相填补。
+        win_clear = ~win_cloud & ~win_nodata
+        w_last = last_noncloud_clear[r0:r1, c0:c1]
+        last_noncloud_clear[r0:r1, c0:c1] = np.where(
+            win_cloud, w_last, win_clear
+        )
+
+        valid = win_clear
         if not valid.any():
             continue
 
@@ -262,11 +273,9 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
         w_best_key = best_key[:, r0:r1, c0:c1]
         w_second_key = second_key[:, r0:r1, c0:c1]
 
-        cand_better, cand_equal = _lex_compare(cand_key, w_best_key)
+        cand_better, _ = _lex_compare(cand_key, w_best_key)
         different = w_source != info["order"]
-        first_place = valid & (~w_filled | (cand_better & different) | (cand_equal & different))
-        # 等键也由“更小序号”决定：后续切片序号更大，cand_equal 理论上仅在
-        # 同切片出现（不可能），这里保守处理为不抢占。
+        # 清晰候选抢占旧最优；等键不可能跨切片出现（键含唯一切片序号），不抢占
         first_place = valid & (~w_filled | (cand_better & different))
         loser = valid & w_filled & ~cand_better & different
         # 出现来自第二个切片的候选：无论胜负都构成重叠
@@ -317,6 +326,20 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
         second_idx[r0:r1, c0:c1] = w_second_idx
 
     # ---- 汇总 ---------------------------------------------------------------
+    # 最终像元仅在“请求顺序中最后一次非云观测为清晰”时有值：被更晚切片声明为
+    # nodata 的像元即使早先被填过，也要回退为目标 nodata（云不参与该裁决，
+    # 仅把该时相当次候选剔除，云隙填补规则不变）
+    void = filled & ~last_noncloud_clear
+    if void.any():
+        keep = ~void
+        filled = filled & keep
+        source_idx[void] = -1
+        mosaic[:, void] = float(target.nodata)
+        best_values[:, void] = np.nan
+        second_idx[void] = -1
+        second_values[:, void] = np.nan
+        overlap_multi &= keep
+
     total = H * W
     covered = int(filled.sum())
     coverage = CoverageOut(

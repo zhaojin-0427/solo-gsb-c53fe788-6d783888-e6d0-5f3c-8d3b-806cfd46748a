@@ -1,0 +1,20 @@
+services:
+  api:
+    build: .
+    image: mosaic-api:latest
+    container_name: mosaic-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - mosaic_data:/data
+    environment:
+      MOSAIC_DB_PATH: /data/mosaics.db
+      # 其余可调参数（均有默认值，可按需覆盖）
+      MOSAIC_MAX_PIXELS: "4000000"
+      MOSAIC_MAX_DIM: "8192"
+      MOSAIC_PREVIEW_EDGE: "512"
+    restart: unless-stopped
+
+volumes:
+  mosaic_data:
+    driver: local

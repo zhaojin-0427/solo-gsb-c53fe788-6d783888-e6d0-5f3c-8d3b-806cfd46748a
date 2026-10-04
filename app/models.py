@@ -5,8 +5,10 @@
 * ``values``：嵌套 JSON 数组（直观，便于复核）；
 * ``png``：base64 编码的 PNG（字节友好，Pillow 编解码）。
 
-对于 ``bands``，PNG 每一个通道按 R,G,B,A 顺序依次对应第 0、1、2、3 波段，
-``dtype`` 描述原始像元数据类型（``uint8``/``uint16``/``float32``）。
+对于 ``bands``，PNG 每一个通道按 R,G,B,A 顺序依次对应第 0、1、2、3 波段
+（``I;16`` 为单波段 16 位灰度）。``bands_dtype`` 描述像元数据类型
+（``uint8``/``uint16``/``float32``）；**省略（null）时对 JSON 数组按内容自动判定，
+负数无数据哨兵原样保留**，对 PNG 则按其位深解码。
 ``cloud_mask`` 使用单波段 8 位 PNG，非零像元为云。
 """
 from __future__ import annotations
@@ -16,6 +18,9 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 DtypeName = Literal["uint8", "uint16", "float32"]
+# 省略 bands_dtype 时的语义：按 JSON 数组内容自动判定（保留负数等哨兵值），
+# 不做任何无符号收窄；与显式声明的 "uint8"/"uint16"/"float32" 是不同请求。
+DtypeNameOrAuto = DtypeName | None
 
 
 class XY(BaseModel):
@@ -50,7 +55,15 @@ class TileIn(BaseModel):
         description="形状 [band, height, width] 的嵌套数组",
     )
     bands_png: str | None = Field(default=None, description="base64 PNG（通道即波段）")
-    bands_dtype: DtypeName = "uint16"
+    bands_dtype: DtypeNameOrAuto = Field(
+        default=None,
+        description=(
+            "像元原始数据类型 uint8/uint16/float32。**省略（null）时按数组内容自动判定**："
+            "整数保留 int64、小数按 float64，负数无数据哨兵（如 -9999）可原样保留；"
+            "显式声明 uint8/uint16 时，任何无法由该无符号类型表示的像元（负数或超上限）"
+            "都会被拒绝（422），绝不静默回绕。PNG 省略该字段时按 PNG 位深（uint8/uint16）解码。"
+        ),
+    )
     cloud_mask: list[list[int]] | None = Field(default=None, description="形状 [height, width]，1=云")
     cloud_mask_png: str | None = Field(default=None, description="base64 单波段 PNG，非零=云")
 
