@@ -1,0 +1,25 @@
+services:
+  mosaic-api:
+    build: .
+    image: mosaic-api:latest
+    container_name: mosaic-api
+    ports:
+      - "8000:8000"
+    volumes:
+      - mosaic-data:/data
+    environment:
+      # 持久化 SQLite 数据库位置（容器内路径，映射到命名卷 mosaic-data）
+      MOSAIC_DB_PATH: /data/mosaics.db
+      # 可选：覆写默认规模/容差参数
+      # MOSAIC_MAX_PIXELS: "4000000"
+      # MOSAIC_ALIGN_TOL: "1e-6"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/healthz').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    restart: unless-stopped
+
+volumes:
+  mosaic-data:

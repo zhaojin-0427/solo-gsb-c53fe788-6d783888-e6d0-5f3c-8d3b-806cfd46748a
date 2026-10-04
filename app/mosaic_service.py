@@ -4,7 +4,8 @@
 
 1. 切片总云量 ``cloud_fraction`` 升序（云少优先）；
 2. 与参考时间（所有切片中的最新采集时间）的时间差升序；
-3. 到切片边缘的距离降序（优先使用切片内部像元，规避边缘）；
+3. 像元到切片左上角原点的纵深距离（行号+列号）降序——优先使用位于切片
+   内部、远离切片起点接缝边缘的像元；
 4. 切片在请求中的序号 ``tile_order`` 升序（最终确定性裁决）。
 
 仿射对齐：切片必须与目标网格同分辨率（允许 1e-6 相对容差），
@@ -20,6 +21,7 @@ from typing import Any
 import numpy as np
 
 from .config import settings
+from .errors import MosaicError  # re-export: from .mosaic_service import MosaicError
 from .models import (
     BBox,
     ConflictEvidenceOut,
@@ -36,10 +38,6 @@ _NEIGH = ((-1, 0), (1, 0), (0, -1), (0, 1))
 _KEY_COMPONENTS = 4
 # 字典序键的“空槽”哨兵，排在任何真实候选之后
 _SENTINEL = np.array([np.inf, np.inf, np.inf, np.inf], dtype=np.float64)
-
-
-class MosaicError(ValueError):
-    """可返回给客户端的 422 业务错误。"""
 
 
 def _parse_time(raw: str, tile_id: str) -> datetime:
@@ -179,16 +177,11 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
             else None
         )
         cloud_fraction = float(clouds[order].mean()) if th * tw else 0.0
-        # 切片局部坐标中到最近边缘的距离（轴对齐，确定性的边缘度量）
+        # 像元到切片左上角原点的纵深距离（行号+列号）：局部坐标越靠内，
+        # 离切片起点处的接缝边缘越远；单/双行高切片上仍可沿列方向区分。
         rows = np.arange(th, dtype=np.float64).reshape(th, 1)
         cols = np.arange(tw, dtype=np.float64).reshape(1, tw)
-        edge_dist = np.minimum(
-            np.minimum(np.broadcast_to(rows, (th, tw)), np.broadcast_to(cols, (th, tw))),
-            np.minimum(
-                np.broadcast_to(th - 1 - rows, (th, tw)),
-                np.broadcast_to(tw - 1 - cols, (th, tw)),
-            ),
-        )
+        edge_dist = np.broadcast_to(rows + cols, (th, tw))
         tile_infos.append(
             {
                 "order": order,
@@ -245,8 +238,14 @@ def build_mosaic(req: MosaicRequest, request_hash: str) -> MosaicOut:
         win_edge = info["edge_dist"][tr0:tr1, tc0:tc1]
 
         valid = ~win_cloud
+        # 哨兵可能以整数（JSON 未声明 dtype）、float64 或 float32 表达，
+        # 容差取 float32 量化量级，既能容忍窄化误差，又远小于相邻整数值间隔 1
+        nodata_mask = np.zeros((r1 - r0, c1 - c0), dtype=bool)
         for k in range(band_count):
-            valid &= win_bands[k] != info["nodata"]
+            nodata_mask |= np.isclose(
+                win_bands[k], info["nodata"], rtol=1e-7, atol=1e-4
+            )
+        valid &= ~nodata_mask
         if not valid.any():
             continue
 

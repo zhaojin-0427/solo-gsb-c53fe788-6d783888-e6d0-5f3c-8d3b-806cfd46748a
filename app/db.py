@@ -91,6 +91,8 @@ def input_summary(payload: dict[str, Any]) -> dict[str, Any]:
                 "pixel_size": t.get("pixel_size"),
                 "origin": t.get("origin"),
                 "nodata": t.get("nodata"),
+                # 显式记录类型声明（None=按内容推断），省略与显式声明不得共用摘要
+                "bands_dtype": t.get("bands_dtype"),
                 "shape": bands_desc,
             }
         )

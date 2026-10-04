@@ -6,8 +6,13 @@
 * ``png``：base64 编码的 PNG（字节友好，Pillow 编解码）。
 
 对于 ``bands``，PNG 每一个通道按 R,G,B,A 顺序依次对应第 0、1、2、3 波段，
-``dtype`` 描述原始像元数据类型（``uint8``/``uint16``/``float32``）。
+``bands_dtype`` 描述原始像元数据类型（``uint8``/``uint16``/``float32``）。
 ``cloud_mask`` 使用单波段 8 位 PNG，非零像元为云。
+
+``bands_dtype`` 对 JSON 数组输入可以省略（``null``）：此时不做任何无符号窄化，
+数组按其实际内容解析（负数无数据哨兵原样保留）。显式声明 ``uint8``/``uint16``
+时，无法表示的像元（如 ``-9999``）会触发 422，而不会静默回绕。PNG 输入省略
+``bands_dtype`` 时，按 PNG 的位深推断（I;16→uint16，L/LA/RGB/RGBA→uint8）。
 """
 from __future__ import annotations
 
@@ -16,6 +21,8 @@ from typing import Any, Literal
 from pydantic import BaseModel, Field, model_validator
 
 DtypeName = Literal["uint8", "uint16", "float32"]
+# 未显式声明 dtype：JSON 数组按内容推断，PNG 按位深推断
+DtypeInput = DtypeName | None
 
 
 class XY(BaseModel):
@@ -50,7 +57,13 @@ class TileIn(BaseModel):
         description="形状 [band, height, width] 的嵌套数组",
     )
     bands_png: str | None = Field(default=None, description="base64 PNG（通道即波段）")
-    bands_dtype: DtypeName = "uint16"
+    bands_dtype: DtypeInput = Field(
+        default=None,
+        description=(
+            "像元数据类型 uint8/uint16/float32；省略时 JSON 数组按内容推断"
+            "（保留负数哨兵），PNG 按位深推断"
+        ),
+    )
     cloud_mask: list[list[int]] | None = Field(default=None, description="形状 [height, width]，1=云")
     cloud_mask_png: str | None = Field(default=None, description="base64 单波段 PNG，非零=云")
 

@@ -93,6 +93,7 @@ def test_nodata_and_uncoverable_hole(client):
     """无数据像元被排除；两者都缺的区域形成空洞并给出连通分量。"""
     a = np.full((1, 4, 4), 10, dtype=np.int32)
     a[0, 0, 0] = -9999
+    a[0, 3, 3] = -9999
     b = np.full((1, 4, 4), 20, dtype=np.int32)
     b[0, 0, 0] = -9999
     b[0, 3, 3] = -9999
@@ -349,8 +350,9 @@ def test_png_encoding_roundtrip(client):
         "bands_dtype": "uint16",
         "cloud_mask_png": cloud_png,
     }
-    other = make_tile("arr-tile", "2026-09-02T10:00:00Z",
-                      np.full((1, 4, 4), 999, np.int32))
+    other_arr = np.full((1, 4, 4), 999, np.int32)
+    other_arr[0, 0, 0] = -9999  # 与 png tile 的云点 (0,0) 重合 -> 空洞
+    other = make_tile("arr-tile", "2026-09-02T10:00:00Z", other_arr)
     payload = {
         "tiles": [tile_png, other],
         "target": base_target(),
@@ -358,9 +360,12 @@ def test_png_encoding_roundtrip(client):
     }
     out = post(client, payload)
     bands = np.array(out["bands"])
-    # 两时相清晰 -> 选新 arr-tile(999)，除 png tile 的云点 (0,0)
-    assert bands[0, 0, 0] == 120
+    # (0,0)：png tile 有云、arr tile 无数据 -> 空洞哨兵；其余区域两时相清晰，
+    # 选更新的 arr-tile(999)，同时验证 I;16 PNG 与 L 云掩膜可正常解码
+    assert bands[0, 0, 0] == -9999.0
+    assert out["source_map"][0][0] == -1
     assert bands[0, 1, 1] == 999
+    assert out["coverage"]["hole_pixels"] == 1
     assert out["preview_png"].startswith("data:image/png;base64,")
     assert out["source_map_png"].startswith("data:image/png;base64,")
 
@@ -389,3 +394,230 @@ def test_determinism(client):
     assert j1["id"] == j2["id"]  # 幂等命中
     assert j1["bands"] == j2["bands"]
     assert j1["source_map"] == j2["source_map"]
+
+
+# ------------------------------------------------- bands_dtype 负数哨兵故障
+
+
+def _dtype_tile(tile_id, acquired_at, array, dtype=None, cloud=None):
+    t = make_tile(tile_id, acquired_at, array, cloud=cloud)
+    if dtype is not None:
+        t["bands_dtype"] = dtype
+    return t
+
+
+def test_negative_nodata_without_dtype_is_kept(client):
+    """省略 bands_dtype：含 -9999 的 JSON 数组必须被接受，哨兵参与无数据筛除。"""
+    a = np.full((1, 2, 2), 100, dtype=np.int32)
+    a[0, 0, 0] = -9999
+    b = np.full((1, 2, 2), 200, dtype=np.int32)
+    b[0, 0, 0] = -9999
+    payload = {
+        "tiles": [
+            _dtype_tile("t1", "2026-09-01T10:00:00Z", a),
+            _dtype_tile("t2", "2026-09-02T10:00:00Z", b),
+        ],
+        "target": base_target(2, 2),
+        "max_time_delta_seconds": 86400,
+    }
+    out = post(client, payload)
+    assert out["coverage"]["covered_pixels"] == 3
+    assert out["coverage"]["hole_pixels"] == 1
+    assert out["bands"][0][0][0] == -9999.0
+    assert out["source_map"][0][0] == -1
+    # 其余像元由更新的 t2 填补
+    assert out["bands"][0][0][1] == 200
+    assert out["source_map"][0][1] == 1
+    assert out["tiles"][0]["used_pixels"] == 0
+    assert out["tiles"][1]["used_pixels"] == 3
+
+
+def test_explicit_unsigned_dtype_rejects_negative_pixels(client):
+    """显式 uint8/uint16 遇到无法表示的像元必须 422，不能回绕成有效值。"""
+    a = np.full((1, 2, 2), 100, dtype=np.int32)
+    a[0, 0, 0] = -9999
+    b = np.full((1, 2, 2), 200, dtype=np.int32)
+
+    for dtype in ("uint16", "uint8"):
+        payload = {
+            "tiles": [
+                _dtype_tile("t1", "2026-09-01T10:00:00Z", a, dtype=dtype),
+                _dtype_tile("t2", "2026-09-02T10:00:00Z", b, dtype=dtype),
+            ],
+            "target": base_target(2, 2),
+            "max_time_delta_seconds": 86400,
+        }
+        r = client.post("/mosaics", json=payload)
+        assert r.status_code == 422, (dtype, r.text)
+        assert dtype in r.json()["detail"]
+
+    # 超过 uint8 范围的非负数同样必须 422（不得静默窄化）
+    wide = np.full((1, 2, 2), 300, dtype=np.int32)
+    payload = {
+        "tiles": [
+            _dtype_tile("t1", "2026-09-01T10:00:00Z", wide, dtype="uint8"),
+            _dtype_tile("t2", "2026-09-02T10:00:00Z", b, dtype="uint8"),
+        ],
+        "target": base_target(2, 2),
+        "max_time_delta_seconds": 86400,
+    }
+    r = client.post("/mosaics", json=payload)
+    assert r.status_code == 422
+    assert "uint8" in r.json()["detail"]
+
+
+def test_explicit_uint16_nonnegative_matches_omitted(client):
+    """显式 uint16（全部可表示）与省略类型：矩阵/空洞/覆盖率/来源逐元素一致。"""
+    a = np.full((1, 2, 2), 100, dtype=np.int32)
+    a[0, 0, 0] = -9999
+    b = np.full((1, 2, 2), 200, dtype=np.int32)
+    cloud = np.zeros((2, 2), np.uint8)
+    cloud[1, 1] = 1
+    # 省略类型的 t1（带 -9999）与显式 uint16 的 t2 混合声明也必须正常协同
+    payload = {
+        "tiles": [
+            _dtype_tile("t1", "2026-09-01T10:00:00Z", a, cloud=cloud),
+            _dtype_tile("t2", "2026-09-02T10:00:00Z", b, dtype="uint16"),
+        ],
+        "target": base_target(2, 2),
+        "max_time_delta_seconds": 86400,
+    }
+    out = post(client, payload)
+    # (0,0) 仅 t1 无数据、t2 清晰 -> 由 t2 填补；(1,1) t1 云、t2 清晰 -> t2
+    assert out["bands"][0][0][0] == 200
+    assert out["source_map"][0][0] == 1
+    assert out["bands"][0][1][1] == 200
+    assert out["source_map"][1][1] == 1
+    assert out["coverage"]["hole_pixels"] == 0
+    assert out["coverage"]["covered_pixels"] == 4
+
+
+def test_omitted_and_explicit_dtype_do_not_share_results(client):
+    """省略类型与显式声明的请求体哈希不同，幂等重试不得错误共用结果。"""
+    a = np.full((1, 2, 2), 10, dtype=np.int32)  # 全部非负
+    b = np.full((1, 2, 2), 20, dtype=np.int32)
+
+    def build(with_dtype):
+        tiles = [
+            _dtype_tile("t1", "2026-09-01T10:00:00Z", a,
+                        dtype="uint16" if with_dtype else None),
+            _dtype_tile("t2", "2026-09-02T10:00:00Z", b,
+                        dtype="uint16" if with_dtype else None),
+        ]
+        return {
+            "tiles": tiles,
+            "target": base_target(2, 2),
+            "max_time_delta_seconds": 86400,
+            # request_id 也随声明形式区分：同 id 不同体必须 409（既有语义）
+            "request_id": "job-dtype-explicit" if with_dtype else "job-dtype-omit",
+        }
+
+    r_omit = client.post("/mosaics", json=build(False))
+    r_explicit = client.post("/mosaics", json=build(True))
+    assert r_omit.status_code == 201 and r_explicit.status_code == 201
+    j_omit, j_explicit = r_omit.json(), r_explicit.json()
+    # 声明差异必须体现在规范化哈希中 -> 分别计算、各自独立的任务 ID
+    assert j_omit["request_hash"] != j_explicit["request_hash"]
+    assert j_omit["id"] != j_explicit["id"]
+    # 但数据语义一致 -> 拼接矩阵与来源逐元素相同
+    assert j_omit["bands"] == j_explicit["bands"]
+    assert j_omit["source_map"] == j_explicit["source_map"]
+    assert j_omit["coverage"] == j_explicit["coverage"]
+
+    # 同一请求体重试仍然幂等命中自身结果
+    r_retry = client.post("/mosaics", json=build(False))
+    assert r_retry.status_code == 200
+    assert r_retry.json()["id"] == j_omit["id"]
+
+
+def test_float32_dtype_accepts_negative_sentinel(client):
+    """显式 float32 可承载负数哨兵，两切片共同无数据处形成空洞。"""
+    a = np.full((1, 2, 2), 1.5, dtype=np.float32)
+    a[0, 0, 0] = -9999.0
+    b = np.full((1, 2, 2), 2.5, dtype=np.float32)
+    b[0, 0, 0] = -9999.0
+    payload = {
+        "tiles": [
+            _dtype_tile("t1", "2026-09-01T10:00:00Z", a, dtype="float32"),
+            _dtype_tile("t2", "2026-09-02T10:00:00Z", b, dtype="float32"),
+        ],
+        "target": base_target(2, 2),
+        "max_time_delta_seconds": 86400,
+    }
+    out = post(client, payload)
+    assert out["coverage"]["hole_pixels"] == 1
+    assert out["bands"][0][0][0] == -9999.0
+    assert out["bands"][0][0][1] == 2.5
+
+
+def test_png_explicit_uint8_overflow_is_422(client):
+    """16 位 PNG 显式声明 uint8 但像素超范围时必须 422，不得回绕。"""
+    import base64
+    import io
+
+    from PIL import Image
+
+    a = np.full((2, 2), 300, dtype=np.uint16)  # 超出 uint8 范围
+    buf = io.BytesIO()
+    Image.fromarray(a, mode="I;16").save(buf, format="PNG")
+    bands_png = base64.b64encode(buf.getvalue()).decode()
+    buf2 = io.BytesIO()
+    Image.fromarray(np.zeros((2, 2), dtype=np.uint8), mode="L").save(buf2, format="PNG")
+    cloud_png = base64.b64encode(buf2.getvalue()).decode()
+    tile_png = {
+        "id": "png16",
+        "acquired_at": "2026-09-01T10:00:00Z",
+        "pixel_size": list(PIXEL),
+        "origin": copy.deepcopy(ORIGIN),
+        "nodata": -9999.0,
+        "bands_png": bands_png,
+        "bands_dtype": "uint8",
+        "cloud_mask_png": cloud_png,
+    }
+    other = make_tile("arr", "2026-09-02T10:00:00Z",
+                      np.full((1, 2, 2), 9, np.int32))
+    payload = {
+        "tiles": [tile_png, other],
+        "target": base_target(2, 2),
+        "max_time_delta_seconds": 86400,
+    }
+    r = client.post("/mosaics", json=payload)
+    assert r.status_code == 422
+    assert "uint8" in r.json()["detail"]
+
+    # 省略 dtype：I;16 按 uint16 推断，300 可表示 -> 正常；
+    # 另一切片全云，清晰区由该 PNG（300）填充，可直接验证 16 位值未被窄化
+    tile_png.pop("bands_dtype")
+    other_cloud = np.ones((2, 2), np.uint8)
+    payload["tiles"][1] = make_tile(
+        "arr", "2026-09-02T10:00:00Z",
+        np.full((1, 2, 2), 9, np.int32), cloud=other_cloud
+    )
+    ok = post(client, payload)
+    assert ok["bands"][0][0][0] == 300
+
+
+def test_input_summary_distinguishes_dtype_declaration(client):
+    """输入摘要必须记录每切片 dtype 声明，省略(null)与显式不得混淆。"""
+    from app import db
+
+    a = np.full((1, 2, 2), 10, np.int32)
+    b = np.full((1, 2, 2), 20, np.int32)
+
+    def payload(with_dtype):
+        return {
+            "tiles": [
+                _dtype_tile("t1", "2026-09-01T10:00:00Z", a,
+                            dtype="uint16" if with_dtype else None),
+                _dtype_tile("t2", "2026-09-02T10:00:00Z", b,
+                            dtype="uint16" if with_dtype else None),
+            ],
+            "target": base_target(2, 2),
+            "max_time_delta_seconds": 86400,
+        }
+
+    omitted = db.input_summary(payload(False))
+    explicit = db.input_summary(payload(True))
+    assert [t["bands_dtype"] for t in omitted["tiles"]] == [None, None]
+    assert [t["bands_dtype"] for t in explicit["tiles"]] == ["uint16", "uint16"]
+    assert db.canonical_hash(payload(False)) != db.canonical_hash(payload(True))
